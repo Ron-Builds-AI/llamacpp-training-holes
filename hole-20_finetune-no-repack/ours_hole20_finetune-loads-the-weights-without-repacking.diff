@@ -1,0 +1,15 @@
+diff --git a/examples/training/finetune.cpp b/examples/training/finetune.cpp
+--- a/examples/training/finetune.cpp
++++ b/examples/training/finetune.cpp
+@@ -62,7 +62,11 @@
+     if (params.cache_type_v != GGML_TYPE_F32) {
+         LOG_INF("%s: force changing v cache type to f32 due to a lack of f16 support for OUT_PROD\n", __func__);
+         params.cache_type_v = GGML_TYPE_F32;
+     }
++    if (!params.no_extra_bufts) {
++        LOG_INF("%s: disabling weight repacking: the backward pass reads the weights in their plain layout\n", __func__);
++        params.no_extra_bufts = true;
++    }
+
+     llama_backend_init();
+     llama_numa_init(params.numa);

@@ -32,7 +32,8 @@ Written 2026-10-08. The upstream states in the Status and Credit sections were r
 - **Windows:** AMD Ryzen 9 9950X3D, Windows 11, Visual Studio 18 2026 (MSVC 19.51), CPU only.
 - **One tree per run.** Each proof run applied the whole set to one tree and measured each defect by removing only its own change
   (or, for a test, applying only the `tests/` part, `git apply --include='tests/*'`). BEFORE and AFTER differ only in the change named.
-  The proof runs were 2026-09-25: the Linux CPU and card, and the Windows CPU.
+  The proof runs were 2026-09-25: the Linux CPU and card, and the Windows CPU. Hole 20 is the exception: its proof run is 2026-10-08, on
+  the Linux CPU, in the tree of the whole set with hole 20 last, and BEFORE is that tree without it.
 - **Builds.** Linux CPU: `cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF`. Linux CUDA: the same with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
   -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12`. Windows: `-DGGML_NATIVE=ON -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON`.
@@ -42,7 +43,7 @@ Written 2026-10-08. The upstream states in the Status and Credit sections were r
   `output.weight` left out so that the output layer is tied to the token embedding (`instruments/make_tied_copy.py`; the file the runs
   used is 290 tensors, SHA256 `10b105fdc755ae8d91f4180c3bd429f276f82976f0c900687425e5e1dd70535a`). The text is in `data/`: `tied_small.txt`
   (the first 45 lines of the companion repository's `REPRO_window_synthetic.txt`, 1,090 tokens) and `short.txt` (its first 1,000 bytes,
-  184 tokens). Synthetic, no third-party text.
+  184 tokens). Synthetic, no third-party text. Hole 20 also uses a Q4_K_M file made from that F32 file, described in its folder.
 - **Reading the counts.** `test-backend-ops` prints `N/M tests passed` over the whole case list, and it counts cases that an `-o` filter
   skipped as passed. `M` is the size of the list, not the number of gradient checks run. In grad mode, read the result line of a case
   (named after the loss node, usually `SUM(...)`), never its header; see hole 15.
@@ -53,8 +54,8 @@ Raw run logs are not in this repository. They carry local paths and machine addr
 
 ## The list
 
-First recorded: holes 1 to 15 and S on 2026-09-24, holes 16 to 19 on 2026-09-25. Several of 1 to 9 were met while testing the
-accumulator fix, which was published on 2026-09-23. Every fix below was proven on 2026-09-25.
+First recorded: holes 1 to 15 and S on 2026-09-24, holes 16 to 20 on 2026-09-25. Several of 1 to 9 were met while testing the
+accumulator fix, which was published on 2026-09-23. Every fix below was proven on 2026-09-25, except hole 20, proven on 2026-10-08.
 
 | # | What breaks on base | Folder | Tested on |
 |---|---|---|---|
@@ -79,11 +80,12 @@ accumulator fix, which was published on 2026-09-23. Every fix below was proven o
 | 17 | `MUL_MAT_ID` backward through quantized expert weights asserts | [hole-17](hole-17_mul-mat-id-backward-quantized-experts) | Windows CPU |
 | 18 | `DIV` and `SUB` backward do not reduce a broadcast `src1`, so the backward build aborts | [hole-18](hole-18_div-sub-backward-broadcast) | Windows CPU |
 | 19 | `CLAMP` has no backward | [hole-19](hole-19_clamp-backward) | Windows CPU |
+| 20 | `llama-finetune` loads quantized weights in the CPU repacked layout, and training aborts on a scheduler assert | [hole-20](hole-20_finetune-no-repack) | Linux CPU |
 
 Each folder's own README has the exact commands and the printed numbers. Holes 8, 9 and 16 to 19 all sit on the path that a
 mixture-of-experts graph takes through the backward pass. In upstream's `build_moe_ffn` (read at `8212c7802`), the experts go through
 `MUL_MAT_ID` (holes 8, 16, 17), the router reads rows of a 3D tensor (hole 9), and the expert weights are divided by a clamped row sum
-(holes 18 and 19).
+(holes 18 and 19). Hole 20 is on another path: how `llama-finetune` loads a quantized model, before the first step runs.
 
 ## Where each patch applies
 
@@ -100,6 +102,12 @@ Checked 2026-10-08 with `git apply --check` on the files each patch touches, tak
 | 9 | applies alone | **does not apply**: 2 hunks rejected, in `ggml-cpu/ops.cpp`, where #29575 (angt, merged 2026-09-29) added the same bounds assert |
 | 16, 17 | need 8 (16 first, then 17) | need 8, which does not apply as is |
 | 19t | applies alone | **does not apply**: 1 hunk rejected, in `test_clamp`, which #29517 (merged 2026-10-06) edited |
+| 20 | applies alone, by `patch -p1 --dry-run` (see below) | applies, by the same dry run (see below) |
+
+Hole 20 was checked another way, on 2026-10-08, and not with `git apply --check`. The old side of its hunk appears once and verbatim in
+`examples/training/finetune.cpp` at `8212c7802`, and GNU `patch -p1 --dry-run` accepts it there, with an offset of 25 lines, and on the same
+file after the whole set. The copy of that file kept from the checks above for master `71ad0590f4` is byte-identical to the one at
+`8212c7802`, so the same result stands for master. On the proof run's tree, `git apply` took it cleanly.
 
 The patches are proven against `8212c7802` as written. Any rebase changes the bytes and would need its own measurement, which has not
 been made. Of #27096, #28520 and #28851, the first two are now in master.
@@ -109,7 +117,7 @@ been made. Of #27096, #28520 and #28851, the first two are now in master.
 In the order the proof runs used, every patch applies to `8212c7802` with line offsets only (checked 2026-10-08, same method as above):
 the companion repository's two patches, #27096, #27690, #28520, then holes 2, 4, 5, 7, 6c, 8, 9, S, 10, 11, 11b, 12, 15, #28851 (hole
 13), hole 14's change (a CUDA file, not in this repository; nothing depends on it), 16, then the tests 18t and 19t, then the fixes 18 and
-19, then 18t3, then 17 and 17t.
+19, then 18t3, then 17 and 17t, then 20.
 
 Dependencies: hole 5's test needs the accumulator reset fix. Hole 6's patches go on top of #27690. Holes 6 and 7 conflict in
 `finetune.cpp` in either order, so with 7 in the tree use 6c. Use one of 6 or 6c. Hole 15 needs 11. Holes 16 and 17 need 8.
@@ -131,10 +139,15 @@ Round 1 (2026-09-24), not repeated in the one-tree run:
 ## What is not claimed
 
 - No claim is made about the quality of any trained model. These are fixes to what trains, what crashes, and what the tests see.
-- Holes 8, 9, S, 16 and 17 are verified with gradient checks at the op level. No end-to-end fine-tune is reported in this repository.
-  Hole 17's test shows agreement with the dequantized weights, which is not a check against the quantized model's own loss.
+- Holes 8, 9, S, 16 and 17 are verified with gradient checks at the op level. No end-to-end fine-tune of a mixture-of-experts model is
+  reported in this repository. Hole 17's test shows agreement with the dequantized weights, which is not a check against the quantized
+  model's own loss.
+- Hole 20's runs are end-to-end on a dense 0.5B model, on a short synthetic text with no validation split, and train 49 small F32 tensors
+  while every other tensor is frozen. They show that the run completes and that the loss falls as F32's does. They do not show that a
+  model improved, nor anything about training the quantized weights themselves.
 - Hole 4 was run on one card (sm_75). Vulkan, Metal and SYCL were not built or run for any patch. Holes 17, 18 and 19 were run on the
-  Windows CPU only.
+  Windows CPU only. Hole 20 was run on the Linux CPU only (AVX2, no AVX512), one model, one text, one run per arm. Its reproduction also
+  needs a local change to `finetune.cpp` that is not in this repository (see its folder).
 - Hole 8's RPC hunk, hole 9's Vulkan line and hole 8's missing CUDA kernel are the parts no build reached.
 - Nothing is claimed about upstream acceptance, and nothing about other authors' pull requests beyond what a run printed.
 - This is not legal advice and makes no statement about anyone's compliance with any licence or policy.
