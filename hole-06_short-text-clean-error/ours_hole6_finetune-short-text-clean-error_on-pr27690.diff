@@ -1,0 +1,43 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 794dcc3..2b3ce92 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2128,6 +2128,12 @@ int64_t common_opt_dataset_ndata(size_t n_tokens, int64_t n_ctx, int64_t stride)
+ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride) {
+     const int64_t ne_datapoint = llama_n_ctx(ctx);
+     const int64_t ndata        = common_opt_dataset_ndata(tokens.size(), ne_datapoint, stride);
++    if (ndata <= 0) {
++        LOG_ERR("%s: the training text has %zu tokens, fewer than the %lld needed for one data point "
++                "(context size %lld + stride %lld + 1), use a longer text or a smaller context size\n", __func__,
++                tokens.size(), (long long) (ne_datapoint + stride + 1), (long long) ne_datapoint, (long long) stride);
++        return nullptr;
++    }
+     ggml_opt_dataset_t result = ggml_opt_dataset_init(
+         GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+ 
+diff --git a/common/common.h b/common/common.h
+index fcf0295..74808d9 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1157,6 +1157,7 @@ inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vect
+ // training utils
+ //
+ 
++// returns nullptr (and logs an error) if the tokens are too few for one data point
+ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride);
+ 
+ // "adamw" or "sgd" (case insensitive)
+diff --git a/examples/training/finetune.cpp b/examples/training/finetune.cpp
+index 44b2843..f5a1dd1 100644
+--- a/examples/training/finetune.cpp
++++ b/examples/training/finetune.cpp
+@@ -60,6 +60,9 @@ int main(int argc, char ** argv) {
+ 
+     std::vector<llama_token> tokens  = common_tokenize(ctx, params.prompt, true);
+     ggml_opt_dataset_t       dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
++    if (dataset == nullptr) {
++        return 1;
++    }
+ 
+     struct lr_opt & lr = params.lr;
+     LOG_INF("-optimizer %s -lr0 %.2g -wd %.2g -lr-min %.2g -min-epochs %.2g -epochs %d -period %.2g -val %.2g\n",

@@ -1,0 +1,135 @@
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f6133f0..17a1449 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -302,6 +302,8 @@ llama_build_and_test(test-model-resolution.cpp)
+ # the test serves its repos from an httplib server, and the library links it privately
+ target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
+ 
++llama_build_and_test(test-mul-mat-id-quantized-grad.cpp)
++
+ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
+   # TODO: repair known memory leaks
+   llama_build_and_test(test-opt.cpp)
+diff --git a/tests/test-mul-mat-id-quantized-grad.cpp b/tests/test-mul-mat-id-quantized-grad.cpp
+new file mode 100644
+index 0000000..1293436
+--- /dev/null
++++ b/tests/test-mul-mat-id-quantized-grad.cpp
+@@ -0,0 +1,116 @@
++// MUL_MAT_ID backward through frozen quantized experts: the gradient of the activations must equal the gradient through the same
++// experts dequantized to f32 beforehand, because the backward dequantizes them. The two differ only in the order of float sums.
++// A finite-difference check cannot test this on the CPU: its forward pass rounds the activations to the quantized dot type.
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <random>
++#include <vector>
++
++// the gradient of sum(mul_mat_id(as, b, ids)) with respect to b, for experts given as raw data of type `type`
++static std::vector<float> grad_of_b(ggml_backend_t backend, ggml_type type, const void * as_data, size_t as_size,
++        const std::vector<float> & b_data, const std::vector<int32_t> & ids_data,
++        int64_t k, int64_t m, int64_t n_mats, int64_t n_used, int64_t n) {
++    ggml_init_params params = {
++        /* .mem_size   = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
++        /* .mem_buffer = */ NULL,
++        /* .no_alloc   = */ true,
++    };
++    ggml_context * ctx = ggml_init(params);
++
++    ggml_tensor * as  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
++    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
++    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
++    ggml_set_param(b);
++
++    ggml_tensor * loss = ggml_sum(ctx, ggml_mul_mat_id(ctx, as, b, ids));
++    ggml_set_loss(loss);
++
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
++    ggml_cgraph * gb = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
++    ggml_build_forward_expand(gf, loss);
++    ggml_graph_cpy(gf, gb);
++    ggml_build_backward_expand(ctx, gb, nullptr);
++
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    ggml_backend_tensor_set(as, as_data, 0, as_size);
++    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size()*sizeof(int32_t));
++    ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size()*sizeof(float));
++
++    ggml_graph_reset(gb); // the loss's gradient is 1, every other gradient 0
++    ggml_backend_graph_compute(backend, gf);
++    ggml_backend_graph_compute(backend, gb);
++
++    ggml_tensor * g = ggml_graph_get_grad(gb, b);
++    std::vector<float> out(ggml_nelements(g));
++    ggml_backend_tensor_get(g, out.data(), 0, ggml_nbytes(g));
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    return out;
++}
++
++int main() {
++    ggml_backend_t backend = ggml_backend_cpu_init();
++
++    // k is a multiple of every block size used here (32 and 256)
++    const int64_t k = 256, m = 16, n = 8, n_mats = 4, n_used = 2;
++
++    std::mt19937 rng(42);
++    std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
++    std::vector<float> w(k*m*n_mats);
++    for (float & x : w) {
++        x = uniform(rng);
++    }
++    std::vector<float> b(k*n_used*n);
++    for (float & x : b) {
++        x = uniform(rng);
++    }
++    // every expert used, and each token's experts distinct
++    std::vector<int32_t> ids(n_used*n);
++    for (int64_t r = 0; r < n; r++) {
++        for (int64_t i = 0; i < n_used; i++) {
++            ids[r*n_used + i] = (int32_t) ((r*n_used + i) % n_mats);
++        }
++    }
++
++    const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K };
++    int n_fail = 0;
++    for (ggml_type type : types) {
++        const size_t row_size = ggml_row_size(type, k);
++        std::vector<uint8_t> q(row_size*m*n_mats);
++        ggml_quantize_chunk(type, w.data(), q.data(), 0, m*n_mats, k, nullptr);
++
++        std::vector<float> wd(k*m*n_mats);
++        const ggml_type_traits * traits = ggml_get_type_traits(type);
++        for (int64_t r = 0; r < m*n_mats; r++) {
++            traits->to_float(q.data() + r*row_size, wd.data() + r*k, k);
++        }
++
++        const std::vector<float> gq = grad_of_b(backend, type, q.data(), q.size(), b, ids, k, m, n_mats, n_used, n);
++        const std::vector<float> gd = grad_of_b(backend, GGML_TYPE_F32, wd.data(), wd.size()*sizeof(float), b, ids, k, m, n_mats, n_used, n);
++
++        double max_diff = 0.0, max_ref = 0.0, norm2 = 0.0;
++        bool finite = true;
++        for (size_t i = 0; i < gd.size(); i++) {
++            finite = finite && std::isfinite(gq[i]) && std::isfinite(gd[i]);
++            max_diff = std::fmax(max_diff, std::fabs((double) gq[i] - (double) gd[i]));
++            max_ref  = std::fmax(max_ref, std::fabs((double) gd[i]));
++            norm2   += (double) gd[i]*gd[i];
++        }
++        const double rel = max_ref > 0.0 ? max_diff/max_ref : INFINITY;
++        const bool ok = finite && norm2 > 0.0 && rel <= 1e-5;
++        printf("%s: max |grad(quantized) - grad(dequantized f32)| / max |grad| = %.3e, |grad| = %.6e: %s\n",
++            ggml_type_name(type), rel, std::sqrt(norm2), ok ? "OK" : "FAIL");
++        n_fail += ok ? 0 : 1;
++    }
++
++    ggml_backend_free(backend);
++    printf("%s\n", n_fail == 0 ? "PASS" : "FAIL");
++    return n_fail == 0 ? 0 : 1;
++}

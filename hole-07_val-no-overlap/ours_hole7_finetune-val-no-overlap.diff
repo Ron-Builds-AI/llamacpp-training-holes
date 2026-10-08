@@ -1,0 +1,49 @@
+diff --git a/examples/training/finetune.cpp b/examples/training/finetune.cpp
+index 44b284391..398f874dd 100644
+--- a/examples/training/finetune.cpp
++++ b/examples/training/finetune.cpp
+@@ -58,8 +58,22 @@ int main(int argc, char ** argv) {
+         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+     }
+ 
+-    std::vector<llama_token> tokens  = common_tokenize(ctx, params.prompt, true);
+-    ggml_opt_dataset_t       dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
++
++    // the windows overlap by n_ctx/2 tokens, so split the tokens first: no validation window may overlap a training window
++    GGML_ASSERT(params.val_split >= 0.0f && params.val_split <= 1.0f);
++    const int64_t stride  = llama_n_ctx(ctx) / 2;
++    const size_t  n_train = tokens.size() * (1.0 - params.val_split);
++    const std::vector<llama_token> tokens_train(tokens.begin(), tokens.begin() + n_train);
++    const std::vector<llama_token> tokens_val(tokens.begin() + n_train, tokens.end());
++
++    ggml_opt_dataset_t dataset_train = common_opt_dataset_init(ctx, tokens_train, stride);
++    ggml_opt_dataset_t dataset_val   = nullptr;
++    if ((int64_t) tokens_val.size() >= llama_n_ctx(ctx) + 1 + stride) {
++        dataset_val = common_opt_dataset_init(ctx, tokens_val, stride);
++    } else if (params.val_split > 0.0f) {
++        LOG_WRN("%s: not enough validation tokens (%zu), skipping validation\n", __func__, tokens_val.size());
++    }
+ 
+     struct lr_opt & lr = params.lr;
+     LOG_INF("-optimizer %s -lr0 %.2g -wd %.2g -lr-min %.2g -min-epochs %.2g -epochs %d -period %.2g -val %.2g\n",
+@@ -76,14 +90,16 @@ int main(int argc, char ** argv) {
+     };
+     llama_opt_init(ctx, model, lopt_params);
+ 
+-    const int64_t idata_split = ggml_opt_dataset_ndata(dataset) * (1.0f - params.val_split);
+-
+     ggml_opt_result_t result_train = ggml_opt_result_init();
+     ggml_opt_result_t result_eval  = ggml_opt_result_init();
+ 
+     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
+-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
++        llama_opt_epoch(ctx, dataset_train, result_train, result_eval, ggml_opt_dataset_ndata(dataset_train),
+                         ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
++        if (dataset_val) {
++            llama_opt_epoch(ctx, dataset_val, result_train, result_eval, /*idata_split =*/ 0,
++                            ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
++        }
+         fprintf(stderr, "\n");
+ 
+         ggml_opt_result_reset(result_train);

@@ -1,0 +1,98 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6994,7 +6994,10 @@ static void ggml_compute_backward(
+                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_out_prod_id(ctx, src1, grad, src2, src0->ne[2]));
+             }
+             if (src1_needs_grads) {
+-                GGML_ASSERT(src0->type == GGML_TYPE_F32);
++                // the gradient of the activations passes back through the expert weights, trained or frozen: the transpose
++                // and the routed matmul below exist for f32 and f16 weights (a quantized block cannot be transposed)
++                GGML_ASSERT((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
++                    "backward pass for MUL_MAT_ID needs f32 or f16 expert weights");
+                 struct ggml_tensor * tmp = ggml_mul_mat_id(ctx, ggml_cont(ctx, ggml_transpose(ctx, src0)), grad, src2); // [n,n_used,n_tokens]
+                 if (!ggml_are_same_shape(tmp, src1)) {
+                     tmp = ggml_repeat_back(ctx, tmp, src1);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5325,9 +5325,10 @@ struct test_mul_mat_id_grad : public test_case {
+     const int64_t m;
+     const int64_t n;
+     const int64_t k;
++    const ggml_type type_a; // f16: frozen experts, only b is a parameter
+ 
+     std::string vars() override {
+-        return VARS_TO_STR6(n_mats, n_used, b, m, n, k);
++        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+     }
+ 
+     // the output is linear in every single parameter, a large step only reduces the rounding error
+@@ -5335,15 +5336,18 @@ struct test_mul_mat_id_grad : public test_case {
+         return 1.0f;
+     }
+ 
+-    test_mul_mat_id_grad(int n_mats = 4, int n_used = 2, bool b = false, int64_t m = 6, int64_t n = 8, int64_t k = 8)
+-        : n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {
++    test_mul_mat_id_grad(int n_mats = 4, int n_used = 2, bool b = false, int64_t m = 6, int64_t n = 8, int64_t k = 8,
++            ggml_type type_a = GGML_TYPE_F32)
++        : n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), type_a(type_a) {
+             GGML_ASSERT(n_used <= n_mats);
+             GGML_ASSERT(n*n_used >= n_mats);
+         }
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+-        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+-        ggml_set_param(as);
++        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
++        if (type_a == GGML_TYPE_F32) {
++            ggml_set_param(as);
++        }
+         ggml_set_name(as, "as");
+ 
+         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+@@ -5365,10 +5369,26 @@ struct test_mul_mat_id_grad : public test_case {
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+-            if (t->type != GGML_TYPE_I32) {
++            if (t->type != GGML_TYPE_I32 && type_a == GGML_TYPE_F32) {
+                 init_tensor_uniform(t);
+                 continue;
+             }
++            if (t->type != GGML_TYPE_I32) {
++                // with f16 experts the forward pass rounds b to f16: values on a grid of 1/8 in [-2, 2] stay exact in f16,
++                // and so do b + 1 and b - 1, so the finite difference with the step of 1 is exact
++                std::vector<float> v(ggml_nelements(t));
++                for (size_t i = 0; i < v.size(); ++i) {
++                    v[i] = (float) ((int) ((i*7 + 3) % 33) - 16) / 8.0f;
++                }
++                if (t->type == GGML_TYPE_F16) {
++                    std::vector<ggml_fp16_t> h(v.size());
++                    ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
++                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
++                } else {
++                    ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
++                }
++                continue;
++            }
+             if (ggml_is_view_op(t->op)) {
+                 continue;
+             }
+@@ -10441,10 +10461,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+     }
+ 
+-    for (bool b : {false, true}) {
+-        test_cases.emplace_back(new test_mul_mat_id_grad(4, 2, b, 6, 8, 8));
+-        test_cases.emplace_back(new test_mul_mat_id_grad(8, 3, b, 5, 16, 4));
+-        test_cases.emplace_back(new test_mul_mat_id_grad(4, 4, b, 3, 2, 5));
++    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (bool b : {false, true}) {
++            test_cases.emplace_back(new test_mul_mat_id_grad(4, 2, b, 6, 8, 8, type_a));
++            test_cases.emplace_back(new test_mul_mat_id_grad(8, 3, b, 5, 16, 4, type_a));
++            test_cases.emplace_back(new test_mul_mat_id_grad(4, 4, b, 3, 2, 5, type_a));
++        }
+     }
+ 
+     // Test IQP panel path for all grid IQ types

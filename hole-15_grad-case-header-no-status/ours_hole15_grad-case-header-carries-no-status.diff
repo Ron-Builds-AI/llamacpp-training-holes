@@ -1,0 +1,38 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -696,6 +696,7 @@ struct test_operation_info {
+     bool is_nothing_compared  = false;
+     bool is_compare_failure   = false;
+     bool is_large_tensor_skip = false;
++    bool is_header            = false; // names a case before anything in it is checked, so it has no status
+ 
+     test_operation_info() = default;
+ 
+@@ -873,6 +874,13 @@ struct console_printer : public printer {
+         printf("  %s(%s): ", info.op_name.c_str(), info.op_params.c_str());
+         fflush(stdout);
+ 
++        // A header only names the case: its result follows on a line of its own
++        if (info.is_header) {
++            printf("\n");
++            fflush(stdout);
++            return;
++        }
++
+         // Handle large tensor skip first
+         if (info.is_large_tensor_skip) {
+             printf("skipping large tensors for speed \n");
+@@ -1856,8 +1864,10 @@ struct test_case {
+             }
+         }
+ 
+-        // Print operation info first
+-        output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend)));
++        // Print operation info first, so that a case that aborts is named; with no status, since nothing is checked yet
++        test_operation_info header_info(op_desc(out), vars(), ggml_backend_name(backend));
++        header_info.is_header = true;
++        output_printer->print_operation(header_info);
+ 
+         // check if the backend supports the ops
+         bool        supported  = true;

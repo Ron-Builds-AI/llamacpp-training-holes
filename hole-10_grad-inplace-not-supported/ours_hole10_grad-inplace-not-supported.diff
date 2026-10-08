@@ -1,0 +1,59 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1194,6 +1194,35 @@
+     return std::regex_search(op_name.data(), op_name.data() + op_name.size(), re);
+ }
+ 
++// true if t is computed in place: a view of another tensor that is not one of the ops that only make a view,
++// the same test as the check "inplace operations are currently not supported" in ggml_build_backward_expand
++static bool is_inplace_op(const ggml_tensor * t) {
++    return t->view_src != nullptr &&
++        t->op != GGML_OP_CPY && t->op != GGML_OP_SET_ROWS && t->op != GGML_OP_VIEW &&
++        t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE;
++}
++
++// true if t is a parameter or is computed from one, which is when ggml_build_backward_expand gives it a gradient
++// (it also skips a few sources that carry no gradient, such as row indices; this does not, so it can only say true more often)
++static bool is_computed_from_param(const ggml_tensor * t, std::unordered_map<const ggml_tensor *, bool> & memo) {
++    if (t->type == GGML_TYPE_I32) {
++        return false;
++    }
++    if (t->flags & GGML_TENSOR_FLAG_PARAM) {
++        return true;
++    }
++    const auto it = memo.find(t);
++    if (it != memo.end()) {
++        return it->second;
++    }
++    bool res = false;
++    for (int j = 0; j < GGML_MAX_SRC && !res; ++j) {
++        res = t->src[j] != nullptr && is_computed_from_param(t->src[j], memo);
++    }
++    memo[t] = res;
++    return res;
++}
++
+ struct test_case {
+     virtual ~test_case() {}
+ 
+@@ -1782,6 +1811,19 @@
+             return true;
+         }
+ 
++        // the backward pass does not support in-place ops: ggml_build_backward_expand aborts on one that needs a gradient
++        {
++            std::unordered_map<const ggml_tensor *, bool> memo;
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (is_inplace_op(t) && is_computed_from_param(t, memo)) {
++                    output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
++                                                                        test_status_t::NOT_SUPPORTED,
++                                                                        std::string("in-place ") + ggml_op_desc(t)));
++                    return true;
++                }
++            }
++        }
++
+         // Print operation info first
+         output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend)));
+ 

@@ -1,0 +1,16 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 254a62b..52352e3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3433,8 +3433,9 @@ struct test_bin_bcast : public test_case {
+             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
+         }
+ 
+-        // The backward pass supports broadcasting only for GGML_ADD:
+-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
++        // ADD is checked with equal shapes only; SUB, MUL and DIV also with a broadcast src1, whose gradient the backward reduces:
++        const bool grad_supported = nf == 1 && !perm1 && !src_overlap &&
++            ((op == ggml_add && ggml_are_same_shape(a, b[0])) || op == ggml_sub || op == ggml_mul || op == ggml_div);
+         if (grad_supported) {
+             ggml_set_param(a);
+             ggml_set_param(b[0]);

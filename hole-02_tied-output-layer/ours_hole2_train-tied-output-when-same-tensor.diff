@@ -1,0 +1,34 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index da9c558..9de00f9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3459,14 +3459,16 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+ // training
+ //
+ 
+-static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
++static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata, bool tied_trainable = false) {
+     if (!tensor || tensor->type != GGML_TYPE_F32) {
+         return;
+     }
+     if (!param_filter(tensor, userdata)) {
+         return;
+     }
+-    if (strcmp(tensor->name, "token_embd.weight") == 0) {
++    if (strcmp(tensor->name, "token_embd.weight") == 0 && !tied_trainable) {
++        LLAMA_LOG_WARN("%s: the output layer is tied to token_embd.weight and will not be trained "
++                       "(it is a separate copy of the token embedding, on a different buffer type)\n", __func__);
+         return; // FIXME
+     }
+     if (strcmp(tensor->name, "rope_freqs.weight") == 0) {
+@@ -3509,7 +3511,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
+     llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud);
+     llama_set_param(model->output_norm,     param_filter, param_filter_ud);
+     llama_set_param(model->output_norm_b,   param_filter, param_filter_ud);
+-    llama_set_param(model->output,          param_filter, param_filter_ud);
++    // a tied output layer is loaded as token_embd.weight: train it only if it is the token embedding tensor itself,
++    // training a separate copy would untie the two, and the saved model would not be the trained one
++    llama_set_param(model->output,          param_filter, param_filter_ud, model->output == model->tok_embd);
+     llama_set_param(model->output_b,        param_filter, param_filter_ud);
+     llama_set_param(model->output_norm_enc, param_filter, param_filter_ud);
+     llama_set_param(model->cls,             param_filter, param_filter_ud);

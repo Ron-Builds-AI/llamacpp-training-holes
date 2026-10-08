@@ -1,0 +1,139 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9dd34c866..18dd96c59 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5447,7 +5447,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_L2_NORM:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_RMS_NORM_BACK:
+-            return ggml_is_contiguous(op->src[0]);
++            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
+             break;
+         case GGML_OP_NONE:
+         case GGML_OP_RESHAPE:
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index c3758cd50..c0327c09c 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -156,13 +156,21 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+-        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+-    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+-    const int tid = threadIdx.x;
++        const float * grad, const float * xf, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
++        const int64_t stride_sample, const float eps) {
++    const int nrows     = gridDim.x;
++    const int nchannels = gridDim.y;
+ 
+-    grad += int64_t(row)*ncols;
+-    xf   += int64_t(row)*ncols;
+-    dst  += int64_t(row)*ncols;
++    const int row       = blockIdx.x;
++    const int channel   = blockIdx.y;
++    const int sample    = blockIdx.z;
++    const int tid       = threadIdx.x;
++
++    const int64_t row_dst = (int64_t(sample)*nchannels + channel)*nrows + row;
++
++    grad += row_dst*ncols;
++    xf   += sample*stride_sample + channel*stride_channel + row*stride_row;
++    dst  += row_dst*ncols;
+ 
+     float sum_xx = 0.0f; // sum for squares of x, equivalent to forward pass
+     float sum_xg = 0.0f; // sum for x * gradient, needed because RMS norm mixes inputs
+@@ -407,13 +415,16 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+     }
+ }
+ 
+-static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
++static void rms_norm_back_f32_cuda(
++        const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
++    const dim3 blocks_num(nrows, nchannels, nsamples);
+     if (ncols < 1024) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+-        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
++        rms_norm_back_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+-        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
++        rms_norm_back_f32<1024><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     }
+ }
+ 
+@@ -663,14 +674,17 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
+     GGML_ASSERT(src0f->type == GGML_TYPE_F32);
+     GGML_ASSERT(  dst->type == GGML_TYPE_F32);
+ 
+-    const int64_t ne00 = src0f->ne[0];
+-    const int64_t nrows = ggml_nrows(src0f);
+-
+     float eps;
+     memcpy(&eps, dst->op_params, sizeof(float));
+     GGML_ASSERT(eps >= 0.0f);
+ 
+-    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
++    const size_t ts0 = ggml_type_size(src0f->type);
++    GGML_ASSERT(src0f->nb[0] == ts0);
++    const int64_t s01 = src0f->nb[1] / ts0;
++    const int64_t s02 = src0f->nb[2] / ts0;
++    const int64_t s03 = src0f->nb[3] / ts0;
++
++    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, src0f->ne[0], src0f->ne[1], src0f->ne[2], src0f->ne[3], s01, s02, s03, eps, stream);
+ }
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4c67805d4..fcd0cd00a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3733,24 +3733,31 @@ struct test_rms_norm : public test_case {
+ struct test_rms_norm_back : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
++    const bool v; // whether b is a non-contiguous view
+     const float eps;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR3(type, ne, eps);
++        return VARS_TO_STR4(type, ne, v, eps);
+     }
+ 
+     test_rms_norm_back(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne = {64, 5, 4, 3},
++            bool v = false,
+             float eps = 1e-6f)
+-        : type(type), ne(ne), eps(eps) {}
++        : type(type), ne(ne), v(v), eps(eps) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+-        ggml_set_name(a, "a");
+-
+         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+         ggml_set_name(b, "b");
+ 
++        if (v) {
++            b = ggml_view_4d(ctx, b, b->ne[0]/2, b->ne[1]/2, b->ne[2]/2, b->ne[3]/2, b->nb[1], b->nb[2], b->nb[3], 0);
++            ggml_set_name(b, "view of b");
++        }
++
++        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, b->ne);
++        ggml_set_name(a, "a");
++
+         ggml_tensor * out = ggml_rms_norm_back(ctx, a, b, eps);
+         ggml_set_name(out, "out");
+ 
+@@ -9756,7 +9763,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
+             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, 1.5f));
+             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, 1.5f));
+-            test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
++            for (bool v : { false, true }) {
++                test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
++            }
+             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));

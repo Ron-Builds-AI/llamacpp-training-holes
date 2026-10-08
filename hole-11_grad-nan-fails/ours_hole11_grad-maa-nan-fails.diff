@@ -1,0 +1,100 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -349,7 +349,10 @@
+ // n: number of values to compare.
+ // expected_vals: optional vector of expected values for a. If expected_vals is not empty, filter out all comparisons where
+ //     a does not match any of the expected values. Needed for noncontinuous gradients where the numerical calculation can fail.
+-static double mean_abs_asymm(const float * a, const float * b, const size_t n, const std::vector<float> & expected_vals) {
++// A pair where a and b are both exactly 0 agrees and is not counted: its asymmetry would be 0/0 = NaN, which would make the
++//     whole mean NaN.
++// n_compared: set to the number of pairs in the mean. If it is 0, nothing was compared and the result is 0.
++static double mean_abs_asymm(const float * a, const float * b, const size_t n, const std::vector<float> & expected_vals, size_t & n_compared) {
+     double sum = 0.0f;
+ 
+     size_t nvalid = 0;
+@@ -367,13 +370,18 @@
+             }
+         }
+ 
++        if (a[i] == 0.0f && b[i] == 0.0f) {
++            continue;
++        }
++
+         const float asymm = (a[i] - b[i]) / (a[i] + b[i]);
+ 
+         sum += fabsf(asymm);
+         nvalid++;
+     }
+ 
+-    return sum/nvalid;
++    n_compared = nvalid;
++    return nvalid > 0 ? sum/nvalid : 0.0;
+ }
+ 
+ // utils for printing the variables of the test cases
+@@ -678,10 +686,14 @@
+     double maa_error     = 0.0;
+     double maa_threshold = 0.0;
+ 
++    // Gradient check that compared nothing
++    std::string nothing_compared_param;
++
+     // Flags for different types of information
+     bool has_error            = false;
+     bool has_gradient_info    = false;
+     bool has_maa_error        = false;
++    bool is_nothing_compared  = false;
+     bool is_compare_failure   = false;
+     bool is_large_tensor_skip = false;
+ 
+@@ -726,6 +738,15 @@
+         }
+     }
+ 
++    // Set that the gradient check of a parameter compared no element
++    void set_nothing_compared(const std::string & param_name) {
++        is_nothing_compared    = true;
++        nothing_compared_param = param_name;
++        if (status == test_status_t::OK) {
++            status = test_status_t::FAIL;
++        }
++    }
++
+     // Set compare failure
+     void set_compare_failure() {
+         is_compare_failure = true;
+@@ -892,6 +913,12 @@
+             printf("[%s] MAA = %.9f > %.9f ", info.op_name.c_str(), info.maa_error, info.maa_threshold);
+         }
+ 
++        // Handle a gradient check that compared nothing
++        if (info.is_nothing_compared) {
++            printf("[%s] nothing compared: every element of the gradient of %s is exactly 0 in both or was filtered out ",
++                   info.op_name.c_str(), info.nothing_compared_param.c_str());
++        }
++
+         // Handle compare failure
+         if (info.is_compare_failure) {
+             printf("compare failed ");
+@@ -1977,8 +2004,18 @@
+                 ggml_backend_tensor_set(t, x0.data(), 0, ggml_nbytes(t));
+             }
+ 
+-            const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect);
+-            if (err > max_maa_err()) {
++            size_t n_compared = 0;
++            const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect, n_compared);
++            // a check that compared nothing checked nothing, unless the gradient is expected to be exactly 0 everywhere
++            if (n_compared == 0 && (expect.size() != 1 || expect[0] != 0.0f)) {
++                test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
++                info.set_nothing_compared(t->name);
++                output_printer->print_operation(info);
++                ok = false;
++                break;
++            }
++            // written so that a NaN fails, since it compares false with any bound
++            if (!(err <= max_maa_err())) {
+                 test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+                 info.set_maa_error(err, max_maa_err());
+                 output_printer->print_operation(info);

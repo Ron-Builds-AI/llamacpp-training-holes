@@ -1,0 +1,18 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7a94fee..6af4daa 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7183,6 +7183,13 @@ static void ggml_compute_backward(
+             }
+             GGML_ASSERT((!src2 || !src2_needs_grads) && "gradients for freq factors not implemented");
+         } break;
++        case GGML_OP_CLAMP: {
++            if (src0_needs_grads) {
++                // the gradient passes where the clamp left x as it was (min <= x <= max) and is 0 where it clamped
++                struct ggml_tensor * clamped = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, tensor, src0)));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_scale_bias(ctx, clamped, -1.0f, 1.0f)));
++            }
++        } break;
+         case GGML_OP_IM2COL: {
+             if (src1_needs_grads) {
+                 const int32_t s0    = ggml_get_op_params_i32(tensor, 0);

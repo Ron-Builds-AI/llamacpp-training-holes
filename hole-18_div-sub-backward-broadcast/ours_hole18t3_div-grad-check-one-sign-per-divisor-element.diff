@@ -1,0 +1,34 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 401b181..8ff3411 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3463,6 +3463,29 @@ struct test_bin_bcast : public test_case {
+             if (op == ggml_mul || op == ggml_div) {
+                 // MUL and DIV have numerical issues around zero:
+                 init_tensor_uniform(t, 0.9f, 1.1f);
++                if (op == ggml_div && t->type == GGML_TYPE_F32 && t->view_src == NULL && strcmp(t->name, "a") == 0 &&
++                        t->ne[0] == ne[0]*nr[0] && t->ne[1] == ne[1]*nr[1] && t->ne[2] == ne[2]*nr[2] && t->ne[3] == ne[3]*nr[3]) {
++                    // one random sign per divisor element, shared by all of its broadcast copies: the gradient check's loss (the sum of
++                    // the outputs) stays near zero, where f32 rounds it finely, and no divisor's summed gradient can cancel
++                    std::mt19937 rng(std::random_device{}());
++                    std::vector<float> sign(ne[0]*ne[1]*ne[2]*ne[3]);
++                    for (float & s : sign) {
++                        s = (rng() & 1) ? -1.0f : 1.0f;
++                    }
++                    std::vector<float> v(ggml_nelements(t));
++                    ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
++                    for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
++                        for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
++                            for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
++                                for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
++                                    const int64_t ib = (((i3 % ne[3])*ne[2] + i2 % ne[2])*ne[1] + i1 % ne[1])*ne[0] + i0 % ne[0];
++                                    v[((i3*t->ne[2] + i2)*t->ne[1] + i1)*t->ne[0] + i0] *= sign[ib];
++                                }
++                            }
++                        }
++                    }
++                    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
++                }
+             } else {
+                 init_tensor_uniform(t);
+             }

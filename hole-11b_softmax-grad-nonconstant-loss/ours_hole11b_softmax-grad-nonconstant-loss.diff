@@ -1,0 +1,63 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1262,6 +1262,11 @@
+         return {};
+     }
+ 
++    // The scalar whose gradient is checked in grad mode, by default the sum of the output.
++    virtual ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) {
++        return ggml_sum(ctx, out);
++    }
++
+     virtual void initialize_tensors(ggml_context * ctx) {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             init_tensor_uniform(t);
+@@ -1831,7 +1836,7 @@
+ 
+ 
+         if (!ggml_is_scalar(out)) {
+-            out = ggml_sum(ctx.get(), out);
++            out = grad_loss(ctx.get(), out);
+             ggml_set_name(out, "sum_of_out");
+         }
+         ggml_set_loss(out);
+@@ -5780,6 +5785,38 @@
+     bool grad_precise() override {
+         return true;
+     }
++
++    // Without sinks every row of the output sums to 1, so the plain sum does not depend on a and its gradient is 0.
++    // Weight the output instead. With sinks the rows do not sum to 1 and the plain sum is kept.
++    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
++        if (sinks) {
++            return test_case::grad_loss(ctx, out);
++        }
++        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
++        ggml_set_name(w, "loss_weights");
++        return ggml_sum(ctx, ggml_mul(ctx, out, w));
++    }
++
++    // Without sinks, the gradient of a carries the factor scale: step the logits, not a, by the same amount at every scale.
++    float grad_eps() override {
++        return sinks ? 1e-1f : 1e-1f/scale;
++    }
++
++    // Loss weights of +1 and -1 in turn: with random weights some elements sit near the weighted mean of their row, their
++    // gradient is near 0 and the float32 finite difference cannot resolve it.
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "loss_weights") == 0) {
++                std::vector<float> w(ggml_nelements(t));
++                for (size_t i = 0; i < w.size(); ++i) {
++                    w[i] = i % 2 == 0 ? 1.0f : -1.0f;
++                }
++                ggml_backend_tensor_set(t, w.data(), 0, ggml_nbytes(t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
+ };
+ 
+ // GGML_OP_SOFT_MAX_BACK

@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 41a0ef1..58af295 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7003,10 +7003,12 @@ static void ggml_compute_backward(
+             }
+             if (src1_needs_grads) {
+                 // the gradient of the activations passes back through the expert weights, trained or frozen: the transpose
+-                // and the routed matmul below exist for f32 and f16 weights (a quantized block cannot be transposed)
+-                GGML_ASSERT((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+-                    "backward pass for MUL_MAT_ID needs f32 or f16 expert weights");
+-                struct ggml_tensor * tmp = ggml_mul_mat_id(ctx, ggml_cont(ctx, ggml_transpose(ctx, src0)), grad, src2); // [n,n_used,n_tokens]
++                // and the routed matmul below exist for f32 and f16 weights, so frozen quantized experts are dequantized to f32
++                // first (a quantized block cannot be transposed); the copy exists only in the backward graph
++                struct ggml_tensor * w = ggml_is_quantized(src0->type) ? ggml_cast(ctx, src0, GGML_TYPE_F32) : src0;
++                GGML_ASSERT((w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16) &&
++                    "backward pass for MUL_MAT_ID needs f32, f16 or quantized expert weights");
++                struct ggml_tensor * tmp = ggml_mul_mat_id(ctx, ggml_cont(ctx, ggml_transpose(ctx, w)), grad, src2); // [n,n_used,n_tokens]
+                 if (!ggml_are_same_shape(tmp, src1)) {
+                     tmp = ggml_repeat_back(ctx, tmp, src1);
+                 }

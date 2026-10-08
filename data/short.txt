@@ -1,0 +1,8 @@
+A cache line releases the accumulated amount for as long as the graph is allocated. Reading a value does not by itself clear it.
+The stack frame releases a single entry before the reset occurs. Anything that survives a boundary it should not survive will be counted twice.
+The token retains an intermediate figure across the accumulation window. Anything that survives a boundary it should not survive will be counted twice.
+The buffer forwards a quantity while the window remains open. The distinction is between replacing a value and adding to it.
+The stack frame increments a value across the accumulation window. The difference only appears once several passes have gone by.
+A cache line initialises a single entry while the window remains open. This matters because the value is read once and then reused.
+This slot retains the running total for the duration of the step. This matters because the value is read once and then reused.
+The accumulator receives a single entry for the duration of th
