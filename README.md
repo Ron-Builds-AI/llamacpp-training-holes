@@ -17,8 +17,9 @@ Written 2026-10-08. The upstream states in the Status and Credit sections were r
 
 - The accumulator fix was opened as #29364 on 2026-09-24 and closed the same day by the maintainer of the ggml training code, not
   merged. The stated reason was review capacity. The closure makes no finding on the patch or its test.
-- #30170, a draft by shashb27 opened 2026-10-08, carries a different change for the same accumulator defect, with a new test. Its
-  description credits srossitto79 for the first report and Ron-Builds-AI for the fix work. Issue #30083 (joelteply) is open.
+- #30170, a draft by shashb27 opened 2026-10-08, carried a different change for the same accumulator defect, with a new test. Its
+  description credited srossitto79 for the first report and Ron-Builds-AI for the fix work. A maintainer closed it the same day under
+  the project's AI usage policy, unmerged. Issue #30083 (joelteply) is open.
 - Nothing in the folders below has been proposed upstream as of this date: #29364 is the only pull request from this account in
   ggml-org/llama.cpp, and the account has opened no issues there. Other authors' pull requests that match holes 1, 3, 6, 13 and 14 are listed in
   [Confirmations](confirmations/README.md).
@@ -152,7 +153,7 @@ Round 1 (2026-09-24), not repeated in the one-tree run:
 | #30142 | edenfunf | hole 14 | open, opened 2026-10-08 |
 | #29575 | angt | bounds assert in `get_rows_back`, overlaps hole 9 | merged 2026-09-29 |
 | #27199 | ngxson | stopped the crash that preceded hole 3 (as the companion repository records) | merged 2026-09-02 |
-| #30170, #30083 | shashb27, joelteply | the accumulator defect, re-filed and re-reported | open (#30170 a draft) |
+| #30170, #30083 | shashb27, joelteply | the accumulator defect, re-filed and re-reported | #30170 closed unmerged 2026-10-08; #30083 open |
 | #29364 | Ron-Builds-AI | the accumulator fix, in the companion repository; hole 5 needs it | closed unmerged 2026-09-24 |
 
 Independent reports of the defects behind hole 6: #27648, #22040, #15535, #15532 and #21037 (read 2026-09-24).

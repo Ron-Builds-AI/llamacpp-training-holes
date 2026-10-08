@@ -21,7 +21,7 @@ accumulator reset fix with `opt_period = 2`, and it expects the accumulator to r
   `7d2f65e9ce936995ce136af3c1172994d4253de5acab6cec7b30e6990bc2add5` and
   `2dc682bc9de5f94689a549904b739a0f5a3279b822bce4bd63d8c8ba4f94962f`). Without it, the crash is gone but the test reads
   `1 2 3 4 5 6`, because master never clears the accumulator.
-- Stacking it on upstream's draft PR #30170 instead of the companion patch was not tested.
+- Stacking it on PR #30170 (closed unmerged 2026-10-08) instead of the companion patch was not tested.
 - The patch alone applies to `8212c7802` and to master `71ad0590f4` (git apply on the touched files, 2026-10-08).
 
 ## Test
