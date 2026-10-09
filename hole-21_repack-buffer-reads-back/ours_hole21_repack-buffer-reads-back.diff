@@ -1,0 +1,269 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -499,6 +499,10 @@
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+ 
++    if (buf->iface.get_tensor == NULL) {
++        GGML_ABORT("%s: tensor %s is in a %s buffer, which cannot be read back", __func__, tensor->name,
++                   ggml_backend_buffer_name(buf));
++    }
+     buf->iface.get_tensor(buf, tensor, data, offset, size);
+ }
+ 
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ #include <cassert>
+ #include <cstdio>  // for GGML_ASSERT
++#include <vector>
+ 
+ #include "repack.h"
+ 
+@@ -4547,9 +4548,184 @@
+ }
+ #endif
+ 
++// Reading repacked weights back: each repack above is a fixed shuffle of bits (and a fixed XOR for some types),
++// so its inverse is learned from the repack itself, one bit at a time; every read is checked by repacking it again.
++typedef int (*repack_fn)(ggml_tensor *, const void *, size_t);
++
++struct repack_inverse {
++    bool                  ok          = false;
++    int64_t               unit_blocks = 0; // block columns in one unit
++    size_t                unit_bytes  = 0; // rows interleaved * unit_blocks * block size
++    std::vector<uint32_t> to;              // bit i of a unit's plain bytes is bit to[i] of its repacked bytes
++    std::vector<int32_t>  to_byte;         // byte j moves whole to byte to_byte[j], or -1
++    std::vector<uint8_t>  flip;            // the repacked bytes of an all-zero unit
++};
++
++static ggml_tensor repack_shape(ggml_type type, int64_t ne0, int64_t ne1, void * data) {
++    ggml_tensor t = {};
++    t.type  = type;
++    t.ne[0] = ne0;
++    t.ne[1] = ne1;
++    t.ne[2] = 1;
++    t.ne[3] = 1;
++    t.nb[0] = ggml_type_size(type);
++    t.nb[1] = t.nb[0] * (ne0 / ggml_blck_size(type));
++    t.nb[2] = t.nb[1] * ne1;
++    t.nb[3] = t.nb[2];
++    t.data  = data;
++    return t;
++}
++
++static int repack_run(repack_fn fn, ggml_type type, int64_t ne0, int64_t ne1, const void * plain, void * packed) {
++    ggml_tensor t = repack_shape(type, ne0, ne1, packed);
++    return fn(&t, plain, ggml_nbytes(&t));
++}
++
++// packed to plain, one unit (nrows_il rows by unit_blocks block columns) at a time
++static void repack_inverse_apply(const repack_inverse & inv, int64_t nrows_il, int64_t nrows, int64_t nblocks,
++                                 size_t bs, const uint8_t * packed, uint8_t * plain) {
++    const int64_t k      = inv.unit_blocks;
++    const int64_t nunits = nblocks / k;
++    std::vector<uint8_t> unit(inv.unit_bytes);
++    for (int64_t g = 0; g < nrows / nrows_il; ++g) {
++        for (int64_t x = 0; x < nunits; ++x) {
++            const uint8_t * y = packed + (size_t) (g * nunits + x) * inv.unit_bytes;
++            for (size_t j = 0; j < inv.unit_bytes; ++j) {
++                const int32_t c = inv.to_byte[j];
++                if (c >= 0) {
++                    unit[j] = y[c] ^ inv.flip[c];
++                    continue;
++                }
++                uint8_t v = 0;
++                for (int z = 0; z < 8; ++z) {
++                    const uint32_t p = inv.to[8 * j + z];
++                    v |= (uint8_t) ((((y[p >> 3] ^ inv.flip[p >> 3]) >> (p & 7)) & 1) << z);
++                }
++                unit[j] = v;
++            }
++            for (int64_t r = 0; r < nrows_il; ++r) {
++                uint8_t * dst = plain + ((size_t) (g * nrows_il + r) * nblocks + x * k) * bs;
++                memcpy(dst, unit.data() + (size_t) (r * k) * bs, (size_t) k * bs);
++            }
++        }
++    }
++}
++
++static repack_inverse repack_inverse_learn(repack_fn fn, ggml_type type, int64_t nrows_il) {
++    const int64_t qk = ggml_blck_size(type);
++    const size_t  bs = ggml_type_size(type);
++    for (int64_t k = 1; k <= 4; k *= 2) {
++        // the probe tensor: two groups of rows by two units of k block columns
++        const int64_t ne0 = 2 * k * qk;
++        const int64_t ne1 = 2 * nrows_il;
++        const size_t  u   = (size_t) (nrows_il * k) * bs;
++        const size_t  n   = 4 * u;
++        std::vector<uint8_t> in(n, 0), zero(n), out(n), back(n);
++        if (repack_run(fn, type, ne0, ne1, in.data(), zero.data()) != 0) {
++            continue; // the repack does not take this width
++        }
++        repack_inverse inv;
++        inv.unit_blocks = k;
++        inv.unit_bytes  = u;
++        inv.flip.assign(zero.begin(), zero.begin() + u);
++        inv.to.assign(8 * u, 0);
++        inv.to_byte.assign(u, -1);
++        bool ok = true;
++        for (size_t i = u; i < n && ok; ++i) {
++            ok = zero[i] == zero[i % u]; // every unit flips the same bits
++        }
++        std::vector<uint8_t> hit(8 * u, 0);
++        for (size_t j = 0; j < u && ok; ++j) {
++            const size_t r = j / ((size_t) k * bs), x = (j / bs) % (size_t) k, b = j % bs;
++            const size_t s = (r * 2 * (size_t) k + x) * bs + b; // byte j of the first unit, in the probe's plain bytes
++            for (int z = 0; z < 8 && ok; ++z) {
++                in[s] = (uint8_t) (1u << z);
++                ok    = repack_run(fn, type, ne0, ne1, in.data(), out.data()) == 0;
++                in[s] = 0;
++                int64_t at = -1;
++                for (size_t q = 0; q < n && ok; ++q) {
++                    const uint8_t d = out[q] ^ zero[q];
++                    if (d == 0) {
++                        continue;
++                    }
++                    if (at >= 0 || q >= u || (d & (d - 1)) != 0) {
++                        ok = false; // the bit reached more than one place, or left the first unit
++                        break;
++                    }
++                    int bit = 0;
++                    while (((d >> bit) & 1) == 0) {
++                        bit++;
++                    }
++                    at = (int64_t) (8 * q) + bit;
++                }
++                if (!ok || at < 0 || hit[at]) {
++                    ok = false;
++                    break;
++                }
++                hit[at]           = 1;
++                inv.to[8 * j + z] = (uint32_t) at;
++            }
++        }
++        if (!ok) {
++            continue;
++        }
++        for (size_t j = 0; j < u; ++j) {
++            bool whole = (inv.to[8 * j] & 7) == 0;
++            for (int z = 1; z < 8 && whole; ++z) {
++                whole = inv.to[8 * j + z] == inv.to[8 * j] + (uint32_t) z;
++            }
++            if (whole) {
++                inv.to_byte[j] = (int32_t) (inv.to[8 * j] >> 3);
++            }
++        }
++        // three random inputs must come back exactly
++        uint64_t seed = 0x9E3779B97F4A7C15ULL;
++        for (int trial = 0; trial < 3 && ok; ++trial) {
++            for (size_t i = 0; i < n; ++i) {
++                seed  = seed * 6364136223846793005ULL + 1442695040888963407ULL;
++                in[i] = (uint8_t) (seed >> 56);
++            }
++            ok = repack_run(fn, type, ne0, ne1, in.data(), out.data()) == 0;
++            if (ok) {
++                repack_inverse_apply(inv, nrows_il, ne1, 2 * k, bs, out.data(), back.data());
++                ok = memcmp(back.data(), in.data(), n) == 0;
++            }
++        }
++        if (ok) {
++            inv.ok = true;
++            return inv;
++        }
++    }
++    return repack_inverse();
++}
++
++// 0: done; -1: the layout is not a fixed shuffle; -2: the self-check failed; -3: the shape does not divide into units
++static int repack_inverse_read(const repack_inverse & inv, repack_fn fn, int64_t nrows_il, const ggml_tensor * t,
++                               uint8_t * plain) {
++    if (!inv.ok) {
++        return -1;
++    }
++    const int64_t nblocks = t->ne[0] / ggml_blck_size(t->type);
++    const int64_t nrows   = ggml_nrows(t);
++    if (nrows % nrows_il != 0 || nblocks % inv.unit_blocks != 0) {
++        return -3;
++    }
++    const size_t nbytes = ggml_nbytes(t);
++    repack_inverse_apply(inv, nrows_il, nrows, nblocks, ggml_type_size(t->type), (const uint8_t *) t->data, plain);
++    std::vector<uint8_t> again(nbytes);
++    ggml_tensor          copy = *t;
++    copy.data                 = again.data();
++    if (fn(&copy, plain, nbytes) != 0 || memcmp(again.data(), t->data, nbytes) != 0) {
++        return -2;
++    }
++    return 0;
++}
++
+ class tensor_traits_base : public ggml::cpu::tensor_traits {
+   public:
+     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
++    // writes the plain bytes of t (ggml_nbytes(t) of them) to data; 0 on success
++    virtual int unpack(const ggml_tensor * t, void * data) const = 0;
+ };
+ 
+ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+@@ -4918,6 +5094,12 @@
+                        (int) NB_COLS, (int) INTER_SIZE);
+         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
+     }
++
++    int unpack(const ggml_tensor * t, void * data) const override {
++        const repack_fn fn = &ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>;
++        static const repack_inverse inv = repack_inverse_learn(fn, t->type, NB_COLS);
++        return repack_inverse_read(inv, fn, NB_COLS, t, (uint8_t *) data);
++    }
+ };
+ 
+ }  // namespace ggml::cpu::repack
+@@ -5159,6 +5341,38 @@
+     GGML_UNUSED(buffer);
+ }
+ 
++static void ggml_backend_cpu_repack_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
++                                                       void * data, size_t offset, size_t size) {
++    // a view reads from the tensor it views: restore that one, then take the view's bytes
++    const ggml_tensor * src  = tensor->view_src ? tensor->view_src : tensor;
++    const size_t        base = tensor->view_src ? tensor->view_offs : 0;
++    const auto * tensor_traits = (const ggml::cpu::repack::tensor_traits_base *) src->extra;
++    GGML_ASSERT(tensor_traits != nullptr && "a tensor in a CPU_REPACK buffer has no repack traits");
++
++    const size_t nbytes = ggml_nbytes(src);
++    GGML_ASSERT(base + offset + size <= nbytes);
++    std::vector<uint8_t> whole;
++    void * plain = data;
++    if (src != tensor || offset != 0 || size != nbytes) {
++        whole.resize(nbytes);
++        plain = whole.data();
++    }
++    const int rc = tensor_traits->unpack(src, plain);
++    if (rc != 0) {
++        const char * why = rc == -1 ? "this layout's repack is not a fixed shuffle of bits" :
++                           rc == -3 ? "its shape does not divide into the layout's units" :
++                                      "the restored bytes did not repack to the bytes in memory";
++        GGML_ABORT("%s: cannot read repacked tensor %s (%s) back: %s; load the model without repacking "
++                   "(--no-repack, or use_extra_bufts = false) to read or save it", __func__, src->name,
++                   ggml_type_name(src->type), why);
++    }
++    if (plain != data) {
++        memcpy(data, (const uint8_t *) plain + base + offset, size);
++    }
++
++    GGML_UNUSED(buffer);
++}
++
+ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+     return "CPU_REPACK";
+ 
+@@ -5175,7 +5389,7 @@
+     buffer->buft              = buft;
+     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
+     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
+-    buffer->iface.get_tensor  = nullptr;
++    buffer->iface.get_tensor  = ggml_backend_cpu_repack_buffer_get_tensor;
+     buffer->iface.cpy_tensor  = nullptr;
+     return buffer;
+ }

@@ -1,0 +1,81 @@
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -16,6 +16,7 @@
+ #include <cassert>
+ #include <cstdio>  // for GGML_ASSERT
+ #include <vector>
++#include <cstdlib>  // getenv, for the proof-only report
+ 
+ #include "repack.h"
+ 
+@@ -5102,6 +5103,61 @@
+     }
+ };
+ 
++// PROOF ONLY, hole 21's test build, not part of the fix: with GGML_REPACK_PROBE_REPORT set, the first use of the CPU_REPACK buffer
++// type learns every layout this file builds, round-trips random blocks through a 3 by 3 unit tensor, and prints one line each.
++template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
++static void repack_probe_report_one(const char * name, ggml_type type) {
++    const repack_fn      fn  = &ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>;
++    const repack_inverse inv = repack_inverse_learn(fn, type, NB_COLS);
++    size_t whole = 0;
++    for (size_t j = 0; j < inv.to_byte.size(); ++j) {
++        whole += inv.to_byte[j] >= 0 ? 1 : 0;
++    }
++    const char * trip = "not run";
++    if (inv.ok) {
++        const int64_t ne0 = 3 * inv.unit_blocks * ggml_blck_size(type);
++        const int64_t ne1 = 3 * NB_COLS;
++        const size_t  n   = (size_t) (ne1 * 3 * inv.unit_blocks) * ggml_type_size(type);
++        std::vector<uint8_t> plain(n), packed(n), back(n);
++        uint64_t seed = 12345;
++        for (size_t i = 0; i < n; ++i) {
++            seed     = seed * 6364136223846793005ULL + 1442695040888963407ULL;
++            plain[i] = (uint8_t) (seed >> 56);
++        }
++        if (repack_run(fn, type, ne0, ne1, plain.data(), packed.data()) != 0) {
++            trip = "the repack refused the 3 by 3 shape";
++        } else {
++            ggml_tensor t  = repack_shape(type, ne0, ne1, packed.data());
++            const int   rc = repack_inverse_read(inv, fn, NB_COLS, &t, back.data());
++            trip = rc != 0 ? "READ REFUSED" : (memcmp(back.data(), plain.data(), n) == 0 ? "EXACT" : "DIFFERS");
++        }
++    }
++    fprintf(stderr, "repack-probe %-11s %s unit_blocks %lld unit_bytes %zu whole_bytes %zu, round trip %s\n", name,
++            inv.ok ? "LEARNED" : "REFUSED", (long long) inv.unit_blocks, inv.unit_bytes, whole, trip);
++}
++
++static bool repack_probe_report() {
++    repack_probe_report_one<block_q1_0, 4, 4>("q1_0_4x4", GGML_TYPE_Q1_0);
++    repack_probe_report_one<block_q1_0, 8, 4>("q1_0_4x8", GGML_TYPE_Q1_0);
++    repack_probe_report_one<block_q4_0, 4, 4>("q4_0_4x4", GGML_TYPE_Q4_0);
++    repack_probe_report_one<block_q4_0, 8, 4>("q4_0_4x8", GGML_TYPE_Q4_0);
++    repack_probe_report_one<block_q4_0, 8, 8>("q4_0_8x8", GGML_TYPE_Q4_0);
++    repack_probe_report_one<block_q4_K, 4, 8>("q4_K_8x4", GGML_TYPE_Q4_K);
++    repack_probe_report_one<block_q4_K, 8, 8>("q4_K_8x8", GGML_TYPE_Q4_K);
++    repack_probe_report_one<block_q5_K, 4, 8>("q5_K_8x4", GGML_TYPE_Q5_K);
++    repack_probe_report_one<block_q5_K, 8, 8>("q5_K_8x8", GGML_TYPE_Q5_K);
++    repack_probe_report_one<block_q6_K, 4, 8>("q6_K_8x4", GGML_TYPE_Q6_K);
++    repack_probe_report_one<block_q6_K, 8, 8>("q6_K_8x8", GGML_TYPE_Q6_K);
++    repack_probe_report_one<block_q2_K, 8, 8>("q2_K_8x8", GGML_TYPE_Q2_K);
++    repack_probe_report_one<block_iq4_nl, 4, 4>("iq4_nl_4x4", GGML_TYPE_IQ4_NL);
++    repack_probe_report_one<block_iq4_nl, 8, 8>("iq4_nl_8x8", GGML_TYPE_IQ4_NL);
++    repack_probe_report_one<block_mxfp4, 4, 4>("mxfp4_4x4", GGML_TYPE_MXFP4);
++    repack_probe_report_one<block_mxfp4, 8, 8>("mxfp4_8x8", GGML_TYPE_MXFP4);
++    repack_probe_report_one<block_q8_0, 4, 4>("q8_0_4x4", GGML_TYPE_Q8_0);
++    repack_probe_report_one<block_q8_0, 8, 4>("q8_0_4x8", GGML_TYPE_Q8_0);
++    return true;
++}
++
+ }  // namespace ggml::cpu::repack
+ 
+ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+@@ -5450,6 +5506,8 @@
+ }  // namespace ggml::cpu::repack
+ 
+ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
++    static const bool probe_report = getenv("GGML_REPACK_PROBE_REPORT") != nullptr && ggml::cpu::repack::repack_probe_report();
++    GGML_UNUSED(probe_report);
+     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type_repack = {
+         /* .iface    = */ {
+                            /* .get_name             = */ ggml_backend_cpu_repack_buffer_type_get_name,

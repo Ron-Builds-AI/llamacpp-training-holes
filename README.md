@@ -26,7 +26,8 @@ Written 2026-10-08. The upstream states in the Status and Credit sections were r
 
 ## Base, machines, method
 
-- **Base:** upstream master `8212c7802455255460ab8e18fc34754560031b34` (2026-09-24), unless a row says otherwise.
+- **Base:** upstream master `8212c7802455255460ab8e18fc34754560031b34` (2026-09-24), unless a row says otherwise. Hole 21 is on master
+  `de7fa0a3c6a2e1b4cd9f22eb8d6bf5b12dbdb63b` (2026-10-08), where the bug it fixes was reproduced; see its folder.
 - **Linux:** Intel i7-10750H, Ubuntu 24.04, gcc 13.3. Its card, an NVIDIA RTX 2070 Max-Q (sm_75, 8 GB), ran the CUDA rows with
   CUDA 12.0 and g++-12 as the host compiler.
 - **Windows:** AMD Ryzen 9 9950X3D, Windows 11, Visual Studio 18 2026 (MSVC 19.51), CPU only.
@@ -54,8 +55,9 @@ Raw run logs are not in this repository. They carry local paths and machine addr
 
 ## The list
 
-First recorded: holes 1 to 15 and S on 2026-09-24, holes 16 to 20 on 2026-09-25. Several of 1 to 9 were met while testing the
-accumulator fix, which was published on 2026-09-23. Every fix below was proven on 2026-09-25, except hole 20, proven on 2026-10-08.
+First recorded: holes 1 to 15 and S on 2026-09-24, holes 16 to 20 on 2026-09-25, hole 21 on 2026-10-08. Several of 1 to 9 were met
+while testing the accumulator fix, which was published on 2026-09-23. Every fix below was proven on 2026-09-25, except holes 20 and 21,
+proven on 2026-10-08.
 
 | # | What breaks on base | Folder | Tested on |
 |---|---|---|---|
@@ -81,11 +83,13 @@ accumulator fix, which was published on 2026-09-23. Every fix below was proven o
 | 18 | `DIV` and `SUB` backward do not reduce a broadcast `src1`, so the backward build aborts | [hole-18](hole-18_div-sub-backward-broadcast) | Windows CPU |
 | 19 | `CLAMP` has no backward | [hole-19](hole-19_clamp-backward) | Windows CPU |
 | 20 | `llama-finetune` loads quantized weights in the CPU repacked layout, and training aborts on a scheduler assert | [hole-20](hole-20_finetune-no-repack) | Linux CPU |
+| 21 | a model loaded with repacked weights cannot be saved: `llama_model_save_to_file` calls a NULL `get_tensor` (reported in #29701 by west-ice-g) | [hole-21](hole-21_repack-buffer-reads-back) | Linux CPU, on master |
 
 Each folder's own README has the exact commands and the printed numbers. Holes 8, 9 and 16 to 19 all sit on the path that a
 mixture-of-experts graph takes through the backward pass. In upstream's `build_moe_ffn` (read at `8212c7802`), the experts go through
 `MUL_MAT_ID` (holes 8, 16, 17), the router reads rows of a 3D tensor (hole 9), and the expert weights are divided by a clamped row sum
-(holes 18 and 19). Hole 20 is on another path: how `llama-finetune` loads a quantized model, before the first step runs.
+(holes 18 and 19). Hole 20 is on another path: how `llama-finetune` loads a quantized model, before the first step runs. Hole 21 is the
+same CPU repacked buffer seen from the save side: weights could be written into it but never read back.
 
 ## Where each patch applies
 
@@ -112,12 +116,16 @@ file after the whole set. The copy of that file kept from the checks above for m
 The patches are proven against `8212c7802` as written. Any rebase changes the bytes and would need its own measurement, which has not
 been made. Of #27096, #28520 and #28851, the first two are now in master.
 
+Hole 21 was checked on 2026-10-08 with `git apply --check` on the two files it touches: it applies on master `de7fa0a3c6a2` (where it was
+built and run, and where the applied files match the tested ones byte for byte) and on `8212c7802` with a line offset (not built there).
+
 ## Applying them together
 
 In the order the proof runs used, every patch applies to `8212c7802` with line offsets only (checked 2026-10-08, same method as above):
 the companion repository's two patches, #27096, #27690, #28520, then holes 2, 4, 5, 7, 6c, 8, 9, S, 10, 11, 11b, 12, 15, #28851 (hole
 13), hole 14's change (a CUDA file, not in this repository; nothing depends on it), 16, then the tests 18t and 19t, then the fixes 18 and
-19, then 18t3, then 17 and 17t, then 20.
+19, then 18t3, then 17 and 17t, then 20. Hole 21 is not part of that order: it touches only `ggml-backend.cpp` and `ggml-cpu/repack.cpp`,
+was proven alone on master, and has not been applied together with the set.
 
 Dependencies: hole 5's test needs the accumulator reset fix. Hole 6's patches go on top of #27690. Holes 6 and 7 conflict in
 `finetune.cpp` in either order, so with 7 in the tree use 6c. Use one of 6 or 6c. Hole 15 needs 11. Holes 16 and 17 need 8.
@@ -148,6 +156,9 @@ Round 1 (2026-09-24), not repeated in the one-tree run:
 - Hole 4 was run on one card (sm_75). Vulkan, Metal and SYCL were not built or run for any patch. Holes 17, 18 and 19 were run on the
   Windows CPU only. Hole 20 was run on the Linux CPU only (AVX2, no AVX512), one model, one text, one run per arm. Its reproduction also
   needs a local change to `finetune.cpp` that is not in this repository (see its folder).
+- Hole 21 was run on the Linux CPU only (AVX2, no AVX512), on master, with four quantizations of one dense 0.5B model, one run per arm.
+  It compares the bytes a save writes, not the outputs of a reloaded model. Of the 18 repack layouts it restores, 4 were exercised through
+  a model on that CPU; the other 14 only on random blocks.
 - Hole 8's RPC hunk, hole 9's Vulkan line and hole 8's missing CUDA kernel are the parts no build reached.
 - Nothing is claimed about upstream acceptance, and nothing about other authors' pull requests beyond what a run printed.
 - This is not legal advice and makes no statement about anyone's compliance with any licence or policy.
@@ -168,6 +179,7 @@ Round 1 (2026-09-24), not repeated in the one-tree run:
 | #27199 | ngxson | stopped the crash that preceded hole 3 (as the companion repository records) | merged 2026-09-02 |
 | #30170, #30083 | shashb27, joelteply | the accumulator defect, re-filed and re-reported | #30170 closed unmerged 2026-10-08; #30083 open |
 | #29364 | Ron-Builds-AI | the accumulator fix, in the companion repository; hole 5 needs it | closed unmerged 2026-09-24 |
+| #29701 | west-ice-g | the report of hole 21, with a reproduction | closed not planned 2026-09-30 |
 
 Independent reports of the defects behind hole 6: #27648, #22040, #15535, #15532 and #21037 (read 2026-09-24).
 
